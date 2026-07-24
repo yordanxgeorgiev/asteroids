@@ -1,85 +1,113 @@
-"""Capture game state and player actions."""
+"""Capture game state in a neural-network-friendly format."""
+
+from __future__ import annotations
 
 import dataclasses
+import heapq
 import math
 from typing import TYPE_CHECKING, Optional
 
-import pygame
+from constants import SCREEN_HEIGHT, SCREEN_WIDTH
 
 if TYPE_CHECKING:
     from asteroid import Asteroid
-    from circleshape import CircleShape
-    from main import Game
     from player import Player
+    from main import Game
+
+# approximate maximum speeds.
+MAX_SHIP_SPEED = 600.0
+MAX_ASTEROID_SPEED = 300.0
+MAX_RADIUS = 100.0
 
 
 @dataclasses.dataclass
 class GameState:
-    """Describes game state at a givent moment in a way the ship AI can understand."""
+    """Compact neural-network input."""
 
-    ship_angle: float
-    """Ship's angle (rotation)."""
+    ship_position: tuple[float, float]
+    ship_velocity: tuple[float, float]
+    ship_direction: tuple[float, float]  # cos(theta), sin(theta)
 
-    asteroid_dist: float
-    """Distance from the ship to the nearest asteroid."""
-
-    asteroid_angle: float
-    """Angle between the ship and the nearest asteroid."""
-
-    asteroid_relative_velocity: "pygame.Vector2"
-    """Relative velocity of the nearest asteroid to the ship. (asteroid's vector - ship's vector)"""
-
-    pressed_keys: list[int]
-    """Keys pressed by the player, e.g. `pygame.K_w` == 119."""
+    # distance,
+    # cos(angle),
+    # sin(angle),
+    # rel_vx,
+    # rel_vy,
+    # radius
+    nearest_asteroids: list[tuple[float, float, float, float, float, float]]
 
 
-def get_game_state(game: "Game") -> Optional["GameState"]:
-    ship = game.player
+def get_game_state(game: "Game") -> Optional[GameState]:
     if not game.asteroids:
-        return
+        return None
 
-    asteroid, dist = get_nearest_asteroid(ship=ship, asteroids=game.asteroids.sprites())
-    ship_angle = round(ship.rotation, 3)
-    asteroid_relative_velocity = asteroid.velocity - ship.velocity
-    asteroid_relative_velocity.x = round(asteroid_relative_velocity.x, 3)
-    asteroid_relative_velocity.y = round(asteroid_relative_velocity.y, 3)
+    ship = game.player
 
-    # get the angle between the ship and the asteroid
-    dx = ship.position.x - asteroid.position.x
-    dy = ship.position.y - asteroid.position.y
-    angle_to_target = math.degrees(math.atan2(dy, dx))
-    angle_difference = (angle_to_target - ship.rotation) % 360
+    rotation = math.radians(ship.rotation)
+
+    ship_position = (
+        ship.position.x / SCREEN_WIDTH,
+        ship.position.y / SCREEN_HEIGHT,
+    )
+
+    ship_velocity = (
+        ship.velocity.x / MAX_SHIP_SPEED,
+        ship.velocity.y / MAX_SHIP_SPEED,
+    )
+
+    ship_direction = (
+        math.cos(rotation),
+        math.sin(rotation),
+    )
+
+    nearest = []
+
+    for asteroid in get_nearest_asteroids(
+        ship,
+        game.asteroids.sprites(),
+        count=5,
+    ):
+        rel = asteroid.position - ship.position
+
+        distance = math.hypot(rel.x, rel.y)
+        max_distance = math.hypot(SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        angle = math.atan2(rel.y, rel.x) - rotation
+
+        rel_velocity = asteroid.velocity - ship.velocity
+
+        nearest.append(
+            (
+                distance / max_distance,
+                math.cos(angle),
+                math.sin(angle),
+                rel_velocity.x / MAX_ASTEROID_SPEED,
+                rel_velocity.y / MAX_ASTEROID_SPEED,
+                asteroid.radius / MAX_RADIUS,
+            )
+        )
+
+    while len(nearest) < 5:
+        nearest.append((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
     return GameState(
-        ship_angle=ship_angle,
-        asteroid_dist=dist,
-        asteroid_angle=angle_difference,
-        asteroid_relative_velocity=asteroid_relative_velocity,
-        pressed_keys=get_pressed_keys(),
+        ship_position=ship_position,
+        ship_velocity=ship_velocity,
+        ship_direction=ship_direction,
+        nearest_asteroids=nearest,
     )
 
 
-def get_nearest_asteroid(
-    ship: "Player", asteroids: list["Asteroid"]
-) -> tuple["Asteroid", float]:
-    def dist(a: "CircleShape", b: "CircleShape") -> float:
-        return round(
-            math.hypot(a.position.x - b.position.x, a.position.y - b.position.y), 3
-        )
-
-    _min_asteroid, _min_dist = asteroids[0], dist(ship, asteroids[0])
-
-    for a in asteroids[1:]:
-        d = dist(ship, a)
-        if d < _min_dist:
-            _min_dist = d
-            _min_asteroid = a
-
-    return _min_asteroid, _min_dist
-
-
-def get_pressed_keys() -> list[int]:
-    """Returns the currently pressed keys."""
-    valid_keys = [pygame.K_a, pygame.K_d, pygame.K_w, pygame.K_s, pygame.K_SPACE]
-    pressed_keys = pygame.key.get_pressed()
-    return [key for key in valid_keys if pressed_keys[key]]
+def get_nearest_asteroids(
+    ship: "Player",
+    asteroids: list["Asteroid"],
+    count: int = 5,
+) -> list["Asteroid"]:
+    return heapq.nsmallest(
+        count,
+        asteroids,
+        key=lambda a: math.hypot(
+            a.position.x - ship.position.x,
+            a.position.y - ship.position.y,
+        ),
+    )

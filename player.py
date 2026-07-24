@@ -28,6 +28,8 @@ class Player(CircleShape):
         self.shots_fired = 0
         self.accuracy = 0
 
+        self.distance_travelled = 0.0
+
     def triangle(self) -> list:
         """Generates players drawn shape."""
         forward = pygame.Vector2(0, 1).rotate(self.rotation)
@@ -74,8 +76,12 @@ class Player(CircleShape):
 
     def move(self, dt: float) -> None:
         """Moves player."""
+        old_position = self.position.copy()
         forward = pygame.Vector2(0, 1).rotate(self.rotation)
-        next_x, next_y = self.position + forward * PLAYER_SPEED * dt
+        next_position = self.position + forward * PLAYER_SPEED * dt
+
+        next_x = next_position.x
+        next_y = next_position.y
 
         if next_x < 0:
             next_x = SCREEN_WIDTH
@@ -88,6 +94,12 @@ class Player(CircleShape):
             next_y -= SCREEN_HEIGHT
 
         self.position = pygame.Vector2(next_x, next_y)
+
+        movement = self.position.distance_to(old_position)
+
+        # ignore edge teleport distances
+        if movement < PLAYER_SPEED * dt * 2:
+            self.distance_travelled += movement
 
     def shoot(self) -> bool:
         """Shoots gun."""

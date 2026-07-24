@@ -1,189 +1,237 @@
+import copy
 import random
-from typing import Optional
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
+import pickle
 
 from ai.nn import DenseLayer, NeuralNetwork
 
 SAVE_PATH = "./ai/best_ship.pkl"
 
 MUTATION_RATE = 0.1
-"""Determines how likely an individual is to mutate."""
+MUTATION_STRENGTH = 0.2
 
-MUTATION_STRENGTH = 0.5
-"""How much a mutation changes an individual."""
+
+def evaluate_ship(ship):
+    from main import Game
+
+    games = 3
+    results = []
+
+    for _ in range(games):
+
+        game = Game(visual=False)
+
+        frames, score = game.sim(ship)
+
+        player = game.player
+
+        fitness = (
+            np.sqrt(frames) * 10
+            + score * 20 * player.accuracy / 100
+            + player.distance_travelled * 0.3
+        )
+
+        results.append(fitness)
+
+    return float(np.mean(results))
 
 
 class GeneticGym:
     """
-    The ships we'd like to train have multisport cards and can visit this gym to get buff.
-    More formally this is a genetic algorithm to train neural networks.
+    Genetic algorithm trainer for Asteroids neural networks.
     """
 
     _ELITES_COUNT = 2
-    """
-    The best individuals of a population are called 'elites', it might be useful to keep
-    their genes for the next population.
-    """
-
-    _mutation_rate: Optional[float] = None
-    _mutation_strength: Optional[float] = None
 
     def __init__(self, population_size: int):
         self.gen_num = 0
         self.population_size = population_size
         self.population = [self._ship_factory() for _ in range(population_size)]
 
-    # annealing mutation rates for diversity early and refinement later
+        self._mutation_rate: float | None = None
+        self._mutation_strength: float | None = None
+
+        self.pool = Pool(processes=cpu_count())
+
     @property
     def mutation_rate(self) -> float:
-        """Determines how likely an individual is to mutate."""
-        if not self._mutation_rate:
-            self._mutation_rate = max(0.01, MUTATION_RATE * 0.99**self.gen_num)
+        if self._mutation_rate is None:
+            self._mutation_rate = max(
+                0.01,
+                MUTATION_RATE * (0.998**self.gen_num),
+            )
+
         return self._mutation_rate
 
     @property
     def mutation_strength(self) -> float:
-        """How much a mutation changes an individual."""
-        if not self._mutation_strength:
-            self._mutation_strength = max(0.01, MUTATION_STRENGTH * 0.98**self.gen_num)
+        if self._mutation_strength is None:
+            self._mutation_strength = max(
+                0.01,
+                MUTATION_STRENGTH * (0.995**self.gen_num),
+            )
+
         return self._mutation_strength
 
-    def _ship_factory(self) -> "NeuralNetwork":
-        """Builds a new random individual - a neural network that's the brain of a ship."""
-        from ai.nn import DenseLayer, relu, softmax
+    def _ship_factory(self) -> NeuralNetwork:
+
+        from ai.nn import relu, sigmoid
 
         return NeuralNetwork(
-            DenseLayer(5, 12, activation=relu),
-            DenseLayer(12, 8, activation=relu),
-            DenseLayer(8, 4, activation=softmax),
+            DenseLayer(36, 64, activation=relu, initializer="he"),
+            DenseLayer(64, 32, activation=relu, initializer="he"),
+            DenseLayer(32, 4, activation=sigmoid, initializer="xavier"),
         )
 
-    def calc_fitness(self, ship: "NeuralNetwork") -> float:
-        """Calculate the fitness of an individual."""
-        from main import Game
-
-        game = Game()
-        i, score = game.sim(ship)
-
-        return score + i / 10
-
     def eval_population(self) -> list[float]:
-        """Evaluates each individual of the current population."""
-        return list(map(self.calc_fitness, self.population))
+        return self.pool.map(
+            evaluate_ship,
+            self.population,
+        )
 
     def get_mating_pool(
-        self, fitness_scores: list[float], tournament_k: int = 3
-    ) -> list["NeuralNetwork"]:
-        """Selects a part of the population that's fit to breed."""
-        sorted_indices = np.argsort(fitness_scores)[::-1]
-        elites = [self.population[i] for i in sorted_indices[: self._ELITES_COUNT]]
+        self,
+        fitness_scores: list[float],
+        tournament_k: int = 3,
+    ) -> list[NeuralNetwork]:
+        ranked = np.argsort(fitness_scores)[::-1]
+        parents = [
+            copy.deepcopy(self.population[i]) for i in ranked[: self._ELITES_COUNT]
+        ]
 
-        # 'tournament' selection
-        selected = elites.copy()
-        while len(selected) < self.population_size // 2:
-            contenders = random.sample(range(self.population_size), tournament_k)
-            best = max(contenders, key=lambda idx: fitness_scores[idx])
-            if fitness_scores[best]:
-                selected.append(self.population[best])
+        while len(parents) < self.population_size // 2:
+            contenders = random.sample(
+                range(self.population_size),
+                tournament_k,
+            )
 
-        return selected
+            winner = max(
+                contenders,
+                key=lambda i: fitness_scores[i],
+            )
+
+            parents.append(copy.deepcopy(self.population[winner]))
+
+        return parents
 
     def crossover(
-        self, parent1: "NeuralNetwork", parent2: "NeuralNetwork"
-    ) -> "NeuralNetwork":
-        """Crossover two individuals to create a new one."""
+        self,
+        parent1: NeuralNetwork,
+        parent2: NeuralNetwork,
+    ) -> NeuralNetwork:
+
         child_layers = []
 
-        for l1, l2 in zip(parent1.layers, parent2.layers):
-            mask = np.random.rand(*l1.weights.shape) < 0.5
-            weights = (
-                np.where(mask, l1.weights, l2.weights)
-                + np.random.randn(*l1.weights.shape) * 0.01
+        for layer1, layer2 in zip(parent1.layers, parent2.layers):
+            weight_mask = np.random.random(layer1.weights.shape) < 0.5
+            weights = np.where(
+                weight_mask,
+                layer1.weights,
+                layer2.weights,
             )
-            mask = np.random.rand(*l1.biases.shape) < 0.5
-            biases = (
-                np.where(mask, l1.biases, l2.biases)
-                + np.random.randn(*l1.biases.shape) * 0.01
+            bias_mask = np.random.random(layer1.biases.shape) < 0.5
+            biases = np.where(
+                bias_mask,
+                layer1.biases,
+                layer2.biases,
             )
-            new_layer = DenseLayer(
-                input_dim=l1.weights.shape[0],
-                output_dim=l1.weights.shape[1],
-                activation=l1.activation,
-                weights=weights.copy(),
-                biases=biases.copy(),
+            child_layers.append(
+                DenseLayer(
+                    input_dim=layer1.weights.shape[0],
+                    output_dim=layer1.weights.shape[1],
+                    activation=layer1.activation,
+                    weights=weights.copy(),
+                    biases=biases.copy(),
+                    initializer="he",
+                )
             )
-            child_layers.append(new_layer)
 
         return NeuralNetwork(*child_layers)
 
-    def mutate(self, nn: "NeuralNetwork"):
-        """Mutates an individual to hopefully make it better or at least a bit different."""
-        for layer in nn.layers:
-            # mutate weights
-            mutation_mask = np.random.rand(*layer.weights.shape) < self.mutation_rate
+    def mutate(self, network: NeuralNetwork):
+        for layer in network.layers:
+            weight_mask = np.random.random(layer.weights.shape) < self.mutation_rate
             layer.weights += (
-                mutation_mask
+                weight_mask
                 * np.random.randn(*layer.weights.shape)
                 * self.mutation_strength
             )
 
-            # mutate biases
-            mutation_mask_bias = (
-                np.random.rand(*layer.biases.shape) < self.mutation_rate
-            )
+            bias_mask = np.random.random(layer.biases.shape) < self.mutation_rate
             layer.biases += (
-                mutation_mask_bias
+                bias_mask
                 * np.random.randn(*layer.biases.shape)
                 * self.mutation_strength
             )
 
+            if random.random() < 0.05:
+                layer.weights += np.random.randn(*layer.weights.shape) * 0.5
+
     def next_generation(self) -> tuple[float, float]:
-        """Creates the next population."""
         fitness_scores = self.eval_population()
         parents = self.get_mating_pool(fitness_scores)
 
-        new_population = parents[: self._ELITES_COUNT].copy()
-        # crossover the population until a fixed population size
+        new_population = [copy.deepcopy(x) for x in parents[: self._ELITES_COUNT]]
+
         while len(new_population) < self.population_size:
             parent1, parent2 = random.sample(parents, 2)
+
             child = self.crossover(parent1, parent2)
             self.mutate(child)
             new_population.append(child)
 
         self.population = new_population
         self.gen_num += 1
-        self._mutation_rate = self._mutation_strength = None
-        return (max(fitness_scores), float(np.mean(fitness_scores)))
+        self._mutation_rate = None
+        self._mutation_strength = None
+
+        return (
+            max(fitness_scores),
+            float(np.mean(fitness_scores)),
+        )
 
     def train(
         self,
         generations: int = 100,
-        *,
         save_result: bool = False,
         display_champion: bool = True,
     ):
-        for i in range(generations):
-            max_fitness, avg_fitness = self.next_generation()
-            print(
-                f"gen = {self.gen_num}, max_fitness = {max_fitness}, avg_fitness = {avg_fitness}"
-            )
 
-        champion = self.population[0]
+        try:
+            for i in range(generations):
+                best, average = self.next_generation()
 
-        if save_result:
-            import pickle
+                if i and i % 10 == 0:
+                    print(
+                        f"generation={self.gen_num} "
+                        f"best={best:.2f} "
+                        f"average={average:.2f}"
+                    )
 
-            with open(SAVE_PATH, "wb") as f:
-                pickle.dump(champion, f)
+            fitness = self.eval_population()
+            champion = self.population[int(np.argmax(fitness))]
 
-        if display_champion:
-            from main import Game
+            if save_result:
+                with open(SAVE_PATH, "wb") as file:
 
-            input("Done, press ENTER to start the simulation.")
-            game = Game()
-            game.start(ship_ai=self.population[0])
+                    pickle.dump(champion, file)
+
+            if display_champion:
+                from main import Game
+
+                input("Training complete. Press ENTER to watch.")
+                Game().start(ship_ai=champion)
+
+        finally:
+            self.pool.close()
+            self.pool.join()
 
 
 if __name__ == "__main__":
-    GeneticGym(population_size=100).train(generations=50, save_result=True)
+
+    GeneticGym(population_size=200).train(
+        generations=1000,
+        save_result=True,
+    )

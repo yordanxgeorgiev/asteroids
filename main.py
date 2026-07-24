@@ -1,4 +1,5 @@
 import itertools
+import os
 from typing import TYPE_CHECKING, Optional
 
 import pygame
@@ -12,14 +13,22 @@ from shot import Shot
 from utils import init_text, is_colliding
 
 if TYPE_CHECKING:
-    from ai.nn import NeuralNetwork
+    import ai.nn
 
 
 class Game:
-    def __init__(self):
-        pygame.init()
 
-        # Groups:
+    def __init__(self, visual: bool = True):
+        self.visual = visual
+
+        if visual:
+            pygame.init()
+        else:
+            # Use a dummy display/audio backend so training can run headlessly.
+            os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+            os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+            pygame.init()
+
         self.updateables = pygame.sprite.Group()
         self.drawables = pygame.sprite.Group()
         self.asteroids = pygame.sprite.Group()
@@ -33,17 +42,24 @@ class Game:
         self.player = Player(x=SCREEN_WIDTH / 2, y=SCREEN_HEIGHT / 2)
         AsteroidField()
 
-    def start(self, ship_ai: Optional["NeuralNetwork"] = None):
-        """Starts the game."""
+    def start(
+        self,
+        ship_ai: Optional["ai.nn.NeuralNetwork"] = None,
+    ):
+        """Visual game loop."""
+        if not self.visual:
+            raise RuntimeError("Game.start() requires visual=True")
+
         init_text()
 
-        dt, clock = 0, pygame.time.Clock()
+        dt = 0
+        clock = pygame.time.Clock()
         screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 
-        # Game loop:
         while True:
             if any(event.type == pygame.QUIT for event in pygame.event.get()):
                 return
+
             if not self.player.alive():
                 print("Game over!")
                 print(f"Score: {self.player.score}")
@@ -51,7 +67,7 @@ class Game:
                 return
 
             if ship_ai:
-                self.ai_move(ship_ai, dt=dt)
+                self.ai_move(ship_ai, dt)
 
             screen.fill("black")
             self._update_sprites(dt=dt, visual_effects=True)
@@ -62,54 +78,60 @@ class Game:
             pygame.display.flip()
             dt = clock.tick(60) / 1000
 
-    def sim(self, ship_ai: "NeuralNetwork", dt: float = 0.05) -> tuple[int, float]:
-        """Starts a simulation of the game - headless and sped up."""
-        from collections import Counter
+    def sim(
+        self,
+        ship_ai: "ai.nn.NeuralNetwork",
+        dt: float = 0.05,
+    ) -> tuple[int, float]:
+        """
+        Headless accelerated simulation.
+        Used by genetic training.
+        """
 
-        taken_actions = Counter()
+        for frame in itertools.count():
 
-        # Game loop:
-        for i in itertools.count():
-            if not self.player.alive() or any(
-                event.type == pygame.QUIT for event in pygame.event.get()
-            ):
-                # punish the ships that are not using all outputs
-                if len(taken_actions) < 4:
-                    return 0, 0
-                return i, self.player.score
+            if not self.player.alive():
+                return (frame, self.player.score)
 
-            action = self.ai_move(ship_ai, dt=dt)
-            taken_actions[action] += 1
-            self._update_sprites(dt=dt)
+            self.ai_move(ship_ai, dt)
+            self._update_sprites(dt=dt, visual_effects=False)
 
-        raise RuntimeError("needed for typehint")
+        raise RuntimeError("unreachable")
 
-    def ai_move(self, ship_ai: "NeuralNetwork", dt: float) -> Optional[int]:
-        """The AI makes a move based on current game state."""
+    def ai_move(
+        self,
+        ship_ai: "ai.nn.NeuralNetwork",
+        dt: float,
+    ) -> list["ai.nn.Action"]:
         from game_state import get_game_state
 
-        if self.asteroids.sprites():
-            game_state = get_game_state(self)
-            if not game_state:
-                return
+        if not self.asteroids.sprites():
+            return []
 
-            ai_action = int(ship_ai.predict(game_state))  # 0, 1, 2, 3
+        game_state = get_game_state(self)
+        if not game_state:
+            return []
 
-            if ai_action == 0:
+        actions = ship_ai.predict(game_state)
+
+        for action in actions:
+
+            if action == 0:
                 self.player.move(dt=dt)
-            if ai_action == 1:
+            elif action == 1:
                 self.player.rotate(dt=dt)
-            if ai_action == 2:
-                self.player.rotate(dt=dt)
-            if ai_action == 3:
+            elif action == 2:
+                self.player.rotate(dt=-dt)
+            elif action == 3:
                 self.player.shoot()
 
-            return ai_action
+        return actions
 
     def _update_sprites(self, dt: float, visual_effects: bool = True):
         self.updateables.update(dt=dt)
 
-        for i, asteroid in enumerate(self.asteroids):
+        asteroids = self.asteroids.sprites()
+        for i, asteroid in enumerate(asteroids):
             if is_colliding(asteroid, self.player):
                 points = asteroid.resolve_collision(obj=self.player) or 0
                 if visual_effects:
@@ -119,8 +141,7 @@ class Game:
                     self.updateables.add(explosion)
                     self.drawables.add(explosion)
                 self.player.respawn(points_lost=points)
-            for j in range(i + 1, len(self.asteroids)):
-                other = self.asteroids.sprites()[j]
+            for other in asteroids[i + 1 :]:
                 if is_colliding(asteroid, other):
                     asteroid.resolve_collision(other)
             for shot in self.shots:
@@ -136,13 +157,12 @@ class Game:
                     shot.kill()
 
     def load_ai(self):
-        """Loads an AI into the game and starts it."""
         import pickle
 
         from ai.genetic_gym import SAVE_PATH
 
-        with open(SAVE_PATH, "rb") as f:
-            ship_ai = pickle.load(f)
+        with open(SAVE_PATH, "rb") as file:
+            ship_ai = pickle.load(file)
 
         self.start(ship_ai=ship_ai)
 
@@ -150,5 +170,5 @@ class Game:
 if __name__ == "__main__":
     Game().start()
 
-    # to start an AI game:
-    # Game().load_ai()
+    # Run trained AI visually
+    # Game(visual=True).load_ai()
